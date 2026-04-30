@@ -478,11 +478,6 @@ func GenerateInferencePodSpec(gpuConfig *sku.GPUConfig, numNodes int) func(*gene
 			},
 		})
 
-		if consts.IsKarpenterProvisioner() {
-			spec.NodeSelector = map[string]string{
-				consts.KarpenterWorkspaceKey: karpenter.WorkspaceLabelValue(ctx.Workspace.Namespace, ctx.Workspace.Name),
-			}
-		}
 		spec.Affinity = &corev1.Affinity{
 			NodeAffinity: &corev1.NodeAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
