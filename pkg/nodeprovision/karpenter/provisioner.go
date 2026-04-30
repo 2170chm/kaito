@@ -71,18 +71,33 @@ func (p *KarpenterProvisioner) Name() string { return "KarpenterProvisioner" }
 
 const nodeClassConfigMapName = "kaito-nodeclasses"
 
-// Start verifies that the Karpenter NodeClass CRD is installed, creates
+// Start verifies that the Karpenter CRDs are installed, creates
 // NodeClass resources from the ConfigMap, and derives DefaultName from labels.
 // Returns an error if Karpenter is not installed.
 func (p *KarpenterProvisioner) Start(ctx context.Context) error {
-	// Check if the NodeClass CRD exists.
-	crdName := p.nodeClassConfig.ResourceName + "." + p.nodeClassConfig.Group
-	crd := &apiextensionsv1.CustomResourceDefinition{}
-	if err := p.client.Get(ctx, types.NamespacedName{Name: crdName}, crd); err != nil {
-		if apierrors.IsNotFound(err) {
-			return fmt.Errorf("NodeClass CRD %q not found — Karpenter must be installed before KAITO when node-provisioner=karpenter", crdName)
+	// Check if the core Karpenter CRDs exist.
+	coreCRDs := []string{
+		"nodepools.karpenter.sh",
+		"nodeclaims.karpenter.sh",
+	}
+	for _, crdName := range coreCRDs {
+		crd := &apiextensionsv1.CustomResourceDefinition{}
+		if err := p.client.Get(ctx, types.NamespacedName{Name: crdName}, crd); err != nil {
+			if apierrors.IsNotFound(err) {
+				return fmt.Errorf("CRD %q not found — Karpenter must be installed before KAITO when node-provisioner=karpenter", crdName)
+			}
+			return fmt.Errorf("checking CRD %q: %w", crdName, err)
 		}
-		return fmt.Errorf("checking NodeClass CRD %q: %w", crdName, err)
+	}
+
+	// Check if the provider-specific NodeClass CRD exists.
+	nodeClassCRDName := p.nodeClassConfig.ResourceName + "." + p.nodeClassConfig.Group
+	crd := &apiextensionsv1.CustomResourceDefinition{}
+	if err := p.client.Get(ctx, types.NamespacedName{Name: nodeClassCRDName}, crd); err != nil {
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("NodeClass CRD %q not found — Karpenter provider must be installed before KAITO when node-provisioner=karpenter", nodeClassCRDName)
+		}
+		return fmt.Errorf("checking NodeClass CRD %q: %w", nodeClassCRDName, err)
 	}
 
 	releaseNS, err := utils.GetReleaseNamespace()
