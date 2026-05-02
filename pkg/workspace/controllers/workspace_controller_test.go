@@ -1198,6 +1198,11 @@ func TestApplyInferenceWorkspaceStatus(t *testing.T) {
 	t.Run("not-ready path clears benchmark condition and result (benchmark on by default)", func(t *testing.T) {
 		wObj := &v1beta1.Workspace{
 			ObjectMeta: v1.ObjectMeta{},
+			Inference: &v1beta1.InferenceSpec{
+				Preset: &v1beta1.PresetSpec{
+					PresetMeta: v1beta1.PresetMeta{Name: "test-model"},
+				},
+			},
 		}
 		// Pre-populate status as if a previous reconcile completed the benchmark.
 		status := &v1beta1.WorkspaceStatus{
