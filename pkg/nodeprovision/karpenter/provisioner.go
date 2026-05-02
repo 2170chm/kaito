@@ -349,8 +349,8 @@ func (p *KarpenterProvisioner) DeleteNodes(ctx context.Context, ws *kaitov1beta1
 type nodeReadinessSnapshot struct {
 	readyWithInstanceTypeCount int
 	nonKarpenterReadyCount     int
-	targetNodeClaimCount  int
-	readyNodeClaims       []*karpenterv1.NodeClaim
+	targetNodeClaimCount       int
+	readyNodeClaims            []*karpenterv1.NodeClaim
 }
 
 // buildNodeReadinessSnapshot lists karpenter NodeClaims and all workspace nodes,
@@ -403,8 +403,8 @@ func (p *KarpenterProvisioner) buildNodeReadinessSnapshot(ctx context.Context, w
 	return &nodeReadinessSnapshot{
 		readyWithInstanceTypeCount: readyWithInstanceTypeCount,
 		nonKarpenterReadyCount:     nonKarpenterReadyCount,
-		targetNodeClaimCount:  targetNodeClaimCount,
-		readyNodeClaims:       readyNodeClaims,
+		targetNodeClaimCount:       targetNodeClaimCount,
+		readyNodeClaims:            readyNodeClaims,
 	}, nil
 }
 
