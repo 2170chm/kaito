@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -35,7 +36,9 @@ import (
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kaito-project/kaito/pkg/nodeprovision"
 	"github.com/kaito-project/kaito/pkg/utils"
+	"github.com/kaito-project/kaito/pkg/utils/consts"
 	"github.com/kaito-project/kaito/pkg/utils/nodeclaim"
+	"github.com/kaito-project/kaito/pkg/utils/resources"
 	"github.com/kaito-project/kaito/pkg/workspace/resource"
 )
 
@@ -227,20 +230,93 @@ func (p *KarpenterProvisioner) waitForNodeClassReady(ctx context.Context, name s
 	})
 }
 
-// ProvisionNodes creates a NodePool for the Workspace. Idempotent — AlreadyExists is ignored.
-// Before creating the NodePool, it verifies the target NodeClass exists and is Ready.
+// countNonKarpenterReadyNodes returns the number of ready, non-deleting nodes
+// that match the workspace's label selector and instance type, excluding
+// karpenter-managed nodes (identified by the workspace-name label).
+func countNonKarpenterReadyNodes(ctx context.Context, c client.Client, ws *kaitov1beta1.Workspace) (int, error) {
+	if ws.Resource.LabelSelector == nil {
+		return 0, nil
+	}
+	nodeList, err := resources.ListNodes(ctx, c, ws.Resource.LabelSelector.MatchLabels)
+	if err != nil {
+		return 0, fmt.Errorf("listing nodes: %w", err)
+	}
+	count := 0
+	for i := range nodeList.Items {
+		node := &nodeList.Items[i]
+		if !resources.NodeIsReadyAndNotDeleting(node) {
+			continue
+		}
+		if node.Labels[corev1.LabelInstanceTypeStable] != ws.Resource.InstanceType {
+			continue
+		}
+		// Exclude karpenter-managed nodes — they are tracked by the NodePool's replicas.
+		if _, isKarpenter := node.Labels[consts.KarpenterWorkspaceNameKey]; isKarpenter {
+			continue
+		}
+		count++
+	}
+	return count, nil
+}
+
+// ProvisionNodes creates or updates a NodePool for the Workspace.
+// Computes delta-based replicas: desiredReplicas = max(0, targetNodeCount - nonKarpenterReadyNodes).
+// If no NodePool exists and desiredReplicas is 0, no NodePool is created.
+// If a NodePool exists, replicas are only increased (never decreased) to avoid
+// disrupting running karpenter nodes when BYO nodes appear.
 func (p *KarpenterProvisioner) ProvisionNodes(ctx context.Context, ws *kaitov1beta1.Workspace) error {
 	nodeClassName := resolveNodeClassName(ws, p.nodeClassConfig)
 	if err := p.checkNodeClassReady(ctx, nodeClassName); err != nil {
 		return fmt.Errorf("NodeClass %q is not ready: %w", nodeClassName, err)
 	}
-	np := generateNodePool(ws, p.nodeClassConfig)
-	if err := p.client.Create(ctx, np); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			return nil
-		}
-		return fmt.Errorf("creating NodePool %q: %w", np.Name, err)
+
+	// Count non-karpenter ready nodes to compute delta.
+	nonKarpenterCount, err := countNonKarpenterReadyNodes(ctx, p.client, ws)
+	if err != nil {
+		return fmt.Errorf("counting non-karpenter nodes: %w", err)
 	}
+
+	desiredReplicas := int64(ws.Status.TargetNodeCount) - int64(nonKarpenterCount)
+	if desiredReplicas <= 0 {
+		return nil
+	}
+
+	nodePoolName := NodePoolName(ws.Namespace, ws.Name)
+	existing := &karpenterv1.NodePool{}
+	err = p.client.Get(ctx, types.NamespacedName{Name: nodePoolName}, existing)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("getting NodePool %q: %w", nodePoolName, err)
+		}
+		np := generateNodePool(ws, p.nodeClassConfig)
+		np.Spec.Replicas = lo.ToPtr(desiredReplicas)
+		if err := p.client.Create(ctx, np); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				return nil
+			}
+			return fmt.Errorf("creating NodePool %q: %w", np.Name, err)
+		}
+		return nil
+	}
+
+	// NodePool exists — only increase replicas, never decrease.
+	// This protects running karpenter nodes when BYO nodes appear after provisioning.
+	currentReplicas := int64(0)
+	if existing.Spec.Replicas != nil {
+		currentReplicas = *existing.Spec.Replicas
+	}
+	if desiredReplicas <= currentReplicas {
+		return nil
+	}
+	existing.Spec.Replicas = lo.ToPtr(desiredReplicas)
+	if err := p.client.Update(ctx, existing); err != nil {
+		return fmt.Errorf("updating NodePool %q replicas to %d: %w", nodePoolName, desiredReplicas, err)
+	}
+	klog.InfoS("Updated NodePool replicas",
+		"nodePool", nodePoolName,
+		"desiredReplicas", desiredReplicas,
+		"nonKarpenterNodes", nonKarpenterCount,
+		"targetNodeCount", ws.Status.TargetNodeCount)
 	return nil
 }
 
@@ -267,39 +343,103 @@ func (p *KarpenterProvisioner) DeleteNodes(ctx context.Context, ws *kaitov1beta1
 	return nil
 }
 
-// EnsureNodesReady returns (true, false, nil) when all expected NodeClaims for
-// the Workspace are present, in Ready state, and have GPU resources available.
-// Returns needRequeue=true when NodeClaims are ready but GPU plugins are not,
-// since GPU readiness is not event-driven.
-func (p *KarpenterProvisioner) EnsureNodesReady(ctx context.Context, ws *kaitov1beta1.Workspace) (bool, bool, error) {
+// nodeReadinessSnapshot holds pre-computed data about node and NodeClaim readiness
+// for a workspace. Used by EnsureNodesReady and CollectNodeStatusInfo to avoid
+// duplicating the same list+count logic.
+type nodeReadinessSnapshot struct {
+	readyWithInstanceType int
+	nonKarpenterReady     int
+	targetNodeClaimCount  int
+	readyNodeClaims       []*karpenterv1.NodeClaim
+}
+
+// buildNodeReadinessSnapshot lists karpenter NodeClaims and all workspace nodes,
+// returning counts needed for readiness decisions.
+func (p *KarpenterProvisioner) buildNodeReadinessSnapshot(ctx context.Context, ws *kaitov1beta1.Workspace) (*nodeReadinessSnapshot, error) {
 	nodePoolName := NodePoolName(ws.Namespace, ws.Name)
 
+	// List karpenter NodeClaims.
 	nodeClaimList := &karpenterv1.NodeClaimList{}
 	if err := p.client.List(ctx, nodeClaimList,
 		client.MatchingLabels{karpenterv1.NodePoolLabelKey: nodePoolName},
 	); err != nil {
-		return false, false, fmt.Errorf("listing NodeClaims for NodePool %q: %w", nodePoolName, err)
+		return nil, fmt.Errorf("listing NodeClaims for NodePool %q: %w", nodePoolName, err)
 	}
 
-	if int32(len(nodeClaimList.Items)) < ws.Status.TargetNodeCount {
+	readyNodeClaims := make([]*karpenterv1.NodeClaim, 0, len(nodeClaimList.Items))
+	for i := range nodeClaimList.Items {
+		if nodeclaim.IsNodeClaimReadyNotDeleting(&nodeClaimList.Items[i]) {
+			readyNodeClaims = append(readyNodeClaims, &nodeClaimList.Items[i])
+		}
+	}
+
+	// List all nodes matching workspace labels (BYO + legacy + karpenter).
+	var matchLabels map[string]string
+	if ws.Resource.LabelSelector != nil {
+		matchLabels = ws.Resource.LabelSelector.MatchLabels
+	}
+	nodeList, err := resources.ListNodes(ctx, p.client, matchLabels)
+	if err != nil {
+		return nil, fmt.Errorf("listing nodes: %w", err)
+	}
+
+	readyWithInstanceType := 0
+	nonKarpenterReady := 0
+	for i := range nodeList.Items {
+		node := &nodeList.Items[i]
+		if !resources.NodeIsReadyAndNotDeleting(node) {
+			continue
+		}
+		if node.Labels[corev1.LabelInstanceTypeStable] == ws.Resource.InstanceType {
+			readyWithInstanceType++
+			if _, ok := node.Labels[consts.KarpenterWorkspaceNameKey]; !ok {
+				nonKarpenterReady++
+			}
+		}
+	}
+
+	targetNodeClaimCount := max(0, int(ws.Status.TargetNodeCount)-nonKarpenterReady)
+
+	return &nodeReadinessSnapshot{
+		readyWithInstanceType: readyWithInstanceType,
+		nonKarpenterReady:     nonKarpenterReady,
+		targetNodeClaimCount:  targetNodeClaimCount,
+		readyNodeClaims:       readyNodeClaims,
+	}, nil
+}
+
+// EnsureNodesReady checks whether enough nodes are ready for the workspace.
+// Counts all node types (BYO, legacy, karpenter) against targetNodeCount.
+// Returns:
+//   - ready: true when all expected nodes are present, Ready, and have GPU resources available.
+//   - needRequeue: true when nodes are ready but GPU plugins are not yet installed
+//     (not event-driven, so the caller should poll again).
+//   - err: non-nil on API errors.
+func (p *KarpenterProvisioner) EnsureNodesReady(ctx context.Context, ws *kaitov1beta1.Workspace) (bool, bool, error) {
+	snap, err := p.buildNodeReadinessSnapshot(ctx, ws)
+	if err != nil {
+		return false, false, err
+	}
+
+	// Step 1: Check NodeClaim readiness.
+	if len(snap.readyNodeClaims) < snap.targetNodeClaimCount {
 		return false, false, nil
 	}
 
-	existingNodeClaims := make([]*karpenterv1.NodeClaim, 0, len(nodeClaimList.Items))
-	for i := range nodeClaimList.Items {
-		if !nodeclaim.IsNodeClaimReadyNotDeleting(&nodeClaimList.Items[i]) {
-			return false, false, nil
-		}
-		existingNodeClaims = append(existingNodeClaims, &nodeClaimList.Items[i])
+	// Step 2: Check that enough Nodes with the correct instance type are ready.
+	if snap.readyWithInstanceType < int(ws.Status.TargetNodeCount) {
+		return false, true, nil
 	}
 
-	// Verify GPU device plugins are ready on all provisioned nodes.
-	pluginReady, err := p.nodeResourceManager.CheckIfNodePluginsReady(ctx, ws, existingNodeClaims)
-	if err != nil {
-		return false, false, fmt.Errorf("checking GPU plugin readiness: %w", err)
-	}
-	if !pluginReady {
-		return false, true, nil // needRequeue=true, GPU not ready yet
+	// Step 3: Check GPU device plugins on karpenter nodes.
+	if len(snap.readyNodeClaims) > 0 {
+		pluginReady, err := p.nodeResourceManager.CheckIfNodePluginsReady(ctx, ws, snap.readyNodeClaims)
+		if err != nil {
+			return false, true, fmt.Errorf("checking GPU plugin readiness: %w", err)
+		}
+		if !pluginReady {
+			return false, true, nil
+		}
 	}
 
 	return true, false, nil
@@ -351,11 +491,9 @@ func (p *KarpenterProvisioner) setDriftBudget(ctx context.Context, workspaceName
 }
 
 // CollectNodeStatusInfo gathers status conditions for workspace status.
-// For karpenter, we check NodeClaim readiness and derive NodeStatus and
-// ResourceStatus from the same data.
+// Counts all ready nodes (BYO + legacy + karpenter) against targetNodeCount.
+// GPU plugin readiness is checked only on karpenter NodeClaims.
 func (p *KarpenterProvisioner) CollectNodeStatusInfo(ctx context.Context, ws *kaitov1beta1.Workspace) ([]metav1.Condition, error) {
-	nodePoolName := NodePoolName(ws.Namespace, ws.Name)
-
 	nodeClaimCond := metav1.Condition{
 		Type:    string(kaitov1beta1.ConditionTypeNodeClaimStatus),
 		Status:  metav1.ConditionFalse,
@@ -375,41 +513,46 @@ func (p *KarpenterProvisioner) CollectNodeStatusInfo(ctx context.Context, ws *ka
 		Message: "node claim or node status condition not ready",
 	}
 
-	nodeClaimList := &karpenterv1.NodeClaimList{}
-	if err := p.client.List(ctx, nodeClaimList,
-		client.MatchingLabels{karpenterv1.NodePoolLabelKey: nodePoolName},
-	); err != nil {
-		return nil, fmt.Errorf("listing NodeClaims for NodePool %q: %w", nodePoolName, err)
-	}
-
-	// Count ready NodeClaims and collect pointers for GPU check.
-	readyCount := 0
-	existingNodeClaims := make([]*karpenterv1.NodeClaim, 0, len(nodeClaimList.Items))
-	for i := range nodeClaimList.Items {
-		if nodeclaim.IsNodeClaimReadyNotDeleting(&nodeClaimList.Items[i]) {
-			readyCount++
-			existingNodeClaims = append(existingNodeClaims, &nodeClaimList.Items[i])
-		}
+	snap, err := p.buildNodeReadinessSnapshot(ctx, ws)
+	if err != nil {
+		return nil, err
 	}
 
 	targetCount := int(ws.Status.TargetNodeCount)
-	if readyCount >= targetCount {
+
+	// NodeClaim condition: are enough karpenter NodeClaims ready?
+	// Non-karpenter nodes (BYO, legacy gpu-provisioner) reduce the target —
+	// they don't have karpenter NodeClaims, so we only need NodeClaims for the remainder.
+	// Legacy gpu-provisioner nodes also have NodeClaims, but those are already stable
+	// and not managed by this provisioner, so we treat them like BYO here.
+	if len(snap.readyNodeClaims) >= snap.targetNodeClaimCount {
 		nodeClaimCond.Status = metav1.ConditionTrue
 		nodeClaimCond.Reason = "NodeClaimsReady"
 		nodeClaimCond.Message = "Enough NodeClaims are ready"
+	}
 
-		// Check GPU plugin readiness on the underlying nodes.
-		pluginReady, err := p.nodeResourceManager.CheckIfNodePluginsReady(ctx, ws, existingNodeClaims)
-		if err != nil {
-			return nil, fmt.Errorf("checking GPU plugin readiness: %w", err)
-		}
-		if pluginReady {
+	// Node condition: are enough nodes ready with GPU resources?
+	// Uses total ready node count (all types). GPU plugin check only applies
+	// to karpenter NodeClaims — BYO/legacy nodes are assumed GPU-ready.
+	if snap.readyWithInstanceType >= targetCount {
+		if len(snap.readyNodeClaims) > 0 {
+			pluginReady, err := p.nodeResourceManager.CheckIfNodePluginsReady(ctx, ws, snap.readyNodeClaims)
+			if err != nil {
+				return nil, fmt.Errorf("checking GPU plugin readiness: %w", err)
+			}
+			if pluginReady {
+				nodeCond.Status = metav1.ConditionTrue
+				nodeCond.Reason = "NodesReady"
+				nodeCond.Message = "Enough Nodes are ready with GPU resources"
+			} else {
+				nodeCond.Reason = "NodePluginsNotReady"
+				nodeCond.Message = "waiting all node plugins to be ready"
+			}
+		} else {
+			// No karpenter NodeClaims — all nodes are BYO/legacy, assume GPU ready.
 			nodeCond.Status = metav1.ConditionTrue
 			nodeCond.Reason = "NodesReady"
 			nodeCond.Message = "Enough Nodes are ready with GPU resources"
-		} else {
-			nodeCond.Reason = "GPUPluginNotReady"
-			nodeCond.Message = "GPU resources not yet available on nodes"
 		}
 	}
 

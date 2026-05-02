@@ -19,8 +19,10 @@ import (
 	"testing"
 
 	"github.com/awslabs/operatorpkg/status"
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,6 +33,7 @@ import (
 
 	kaitov1beta1 "github.com/kaito-project/kaito/api/v1beta1"
 	"github.com/kaito-project/kaito/pkg/nodeprovision"
+	"github.com/kaito-project/kaito/pkg/utils/consts"
 	"github.com/kaito-project/kaito/pkg/utils/test"
 )
 
@@ -64,6 +67,42 @@ func mockNodeClassReady(mockClient *test.MockClient, name string) {
 		Return(nil)
 }
 
+// mockEmptyNodeList sets up an empty NodeList for List calls.
+func mockEmptyNodeList(mockClient *test.MockClient) {
+	mockClient.CreateMapWithType(&corev1.NodeList{})
+	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&corev1.NodeList{}), mock.Anything).Return(nil)
+}
+
+// mockNodePoolNotFound sets up a Get call for NodePool that returns NotFound.
+func mockNodePoolNotFound(mockClient *test.MockClient, name string) {
+	notFoundErr := apierrors.NewNotFound(schema.GroupResource{Group: "karpenter.sh", Resource: "nodepools"}, name)
+	mockClient.On("Get", mock.IsType(context.Background()), mock.MatchedBy(func(key client.ObjectKey) bool {
+		return key.Name == name
+	}), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(notFoundErr)
+}
+
+// makeReadyNode creates a ready Node with the given name, instance type, and extra labels.
+func makeReadyNode(name, instanceType string, extraLabels map[string]string) *corev1.Node {
+	labels := map[string]string{
+		"apps":                         "llm",
+		corev1.LabelInstanceTypeStable: instanceType,
+	}
+	for k, v := range extraLabels {
+		labels[k] = v
+	}
+	return &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   name,
+			Labels: labels,
+		},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{
+				{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+}
+
 func TestKarpenterProvisionerImplementsInterface(t *testing.T) {
 	mockClient := test.NewClient()
 	var _ nodeprovision.NodeProvisioner = NewKarpenterProvisioner(mockClient, testConfig)
@@ -87,22 +126,203 @@ func TestStart_CRDNotFound(t *testing.T) {
 
 // --- ProvisionNodes tests ---
 
-func TestProvisionNodes_Success(t *testing.T) {
+func TestProvisionNodes_NoBYONodes_CreatesWithFullReplicas(t *testing.T) {
 	mockClient := test.NewClient()
 	mockNodeClassReady(mockClient, "image-family-ubuntu")
+	mockEmptyNodeList(mockClient)
+	mockNodePoolNotFound(mockClient, "default-ws1")
 	mockClient.On("Create", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(nil)
 
 	p := NewKarpenterProvisioner(mockClient, testConfig)
-	ws := newTestWorkspace("default", "ws1", "Standard_NC24ads_A100_v4", 1, nil, nil)
+	ws := newTestWorkspace("default", "ws1", "Standard_NC24ads_A100_v4", 2, nil, nil)
 
 	err := p.ProvisionNodes(context.Background(), ws)
 	assert.NoError(t, err)
-	mockClient.AssertExpectations(t)
+
+	// Verify replicas = targetNodeCount (2) since no BYO nodes.
+	for _, call := range mockClient.Calls {
+		if call.Method == "Create" {
+			if np, ok := call.Arguments[1].(*karpenterv1.NodePool); ok {
+				assert.Equal(t, int64(2), *np.Spec.Replicas)
+			}
+		}
+	}
+}
+
+func TestProvisionNodes_DeltaWithBYONodes(t *testing.T) {
+	mockClient := test.NewClient()
+	mockNodeClassReady(mockClient, "image-family-ubuntu")
+
+	// 1 BYO node exists (ready, correct instance type, no karpenter label).
+	nodeList := &corev1.NodeList{}
+	nodeMap := mockClient.CreateMapWithType(nodeList)
+	nodeMap[client.ObjectKeyFromObject(makeReadyNode("byo-1", "Standard_NC24ads_A100_v4", nil))] =
+		makeReadyNode("byo-1", "Standard_NC24ads_A100_v4", nil)
+	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&corev1.NodeList{}), mock.Anything).Return(nil)
+
+	mockNodePoolNotFound(mockClient, "default-ws1")
+	mockClient.On("Create", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(nil)
+
+	p := NewKarpenterProvisioner(mockClient, testConfig)
+	ws := newTestWorkspace("default", "ws1", "Standard_NC24ads_A100_v4", 2, nil, nil)
+
+	err := p.ProvisionNodes(context.Background(), ws)
+	assert.NoError(t, err)
+
+	// desiredReplicas = 2 - 1 = 1
+	for _, call := range mockClient.Calls {
+		if call.Method == "Create" {
+			if np, ok := call.Arguments[1].(*karpenterv1.NodePool); ok {
+				assert.Equal(t, int64(1), *np.Spec.Replicas)
+			}
+		}
+	}
+}
+
+func TestProvisionNodes_KarpenterNodesExcludedFromDelta(t *testing.T) {
+	mockClient := test.NewClient()
+	mockNodeClassReady(mockClient, "image-family-ubuntu")
+
+	// 1 karpenter node (has workspace-name label — excluded from non-karpenter count).
+	nodeList := &corev1.NodeList{}
+	nodeMap := mockClient.CreateMapWithType(nodeList)
+	karpenterNode := makeReadyNode("karpenter-1", "Standard_NC24ads_A100_v4", map[string]string{
+		consts.KarpenterWorkspaceNameKey: "ws1",
+	})
+	nodeMap[client.ObjectKeyFromObject(karpenterNode)] = karpenterNode
+	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&corev1.NodeList{}), mock.Anything).Return(nil)
+
+	mockNodePoolNotFound(mockClient, "default-ws1")
+	mockClient.On("Create", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(nil)
+
+	p := NewKarpenterProvisioner(mockClient, testConfig)
+	ws := newTestWorkspace("default", "ws1", "Standard_NC24ads_A100_v4", 2, nil, nil)
+
+	err := p.ProvisionNodes(context.Background(), ws)
+	assert.NoError(t, err)
+
+	// desiredReplicas = 2 (karpenter node excluded from non-karpenter count).
+	for _, call := range mockClient.Calls {
+		if call.Method == "Create" {
+			if np, ok := call.Arguments[1].(*karpenterv1.NodePool); ok {
+				assert.Equal(t, int64(2), *np.Spec.Replicas)
+			}
+		}
+	}
+}
+
+func TestProvisionNodes_ZeroReplicasWhenBYOSufficient_NoCreateCalled(t *testing.T) {
+	mockClient := test.NewClient()
+	mockNodeClassReady(mockClient, "image-family-ubuntu")
+
+	// 2 BYO nodes, target=2 → desiredReplicas=0, no NodePool should be created.
+	nodeList := &corev1.NodeList{}
+	nodeMap := mockClient.CreateMapWithType(nodeList)
+	for _, name := range []string{"byo-1", "byo-2"} {
+		node := makeReadyNode(name, "Standard_NC24ads_A100_v4", nil)
+		nodeMap[client.ObjectKeyFromObject(node)] = node
+	}
+	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&corev1.NodeList{}), mock.Anything).Return(nil)
+
+	mockNodePoolNotFound(mockClient, "default-ws1")
+
+	p := NewKarpenterProvisioner(mockClient, testConfig)
+	ws := newTestWorkspace("default", "ws1", "Standard_NC24ads_A100_v4", 2, nil, nil)
+
+	err := p.ProvisionNodes(context.Background(), ws)
+	assert.NoError(t, err)
+	mockClient.AssertNotCalled(t, "Create", mock.Anything, mock.IsType(&karpenterv1.NodePool{}), mock.Anything)
+}
+
+func TestProvisionNodes_DoesNotDecreaseReplicas(t *testing.T) {
+	mockClient := test.NewClient()
+	mockNodeClassReady(mockClient, "image-family-ubuntu")
+
+	// 1 BYO node appeared after NodePool was created with replicas=2.
+	nodeList := &corev1.NodeList{}
+	nodeMap := mockClient.CreateMapWithType(nodeList)
+	nodeMap[client.ObjectKeyFromObject(makeReadyNode("byo-1", "Standard_NC24ads_A100_v4", nil))] =
+		makeReadyNode("byo-1", "Standard_NC24ads_A100_v4", nil)
+	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&corev1.NodeList{}), mock.Anything).Return(nil)
+
+	// NodePool exists with replicas=2.
+	existingNP := &karpenterv1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "default-ws1"},
+		Spec:       karpenterv1.NodePoolSpec{Replicas: lo.ToPtr(int64(2))},
+	}
+	mockClient.CreateOrUpdateObjectInMap(existingNP)
+	mockClient.On("Get", mock.IsType(context.Background()), mock.MatchedBy(func(key client.ObjectKey) bool {
+		return key.Name == "default-ws1"
+	}), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(nil)
+
+	p := NewKarpenterProvisioner(mockClient, testConfig)
+	ws := newTestWorkspace("default", "ws1", "Standard_NC24ads_A100_v4", 2, nil, nil)
+
+	err := p.ProvisionNodes(context.Background(), ws)
+	assert.NoError(t, err)
+	// desiredReplicas=1 < currentReplicas=2 → no update.
+	mockClient.AssertNotCalled(t, "Update", mock.Anything, mock.IsType(&karpenterv1.NodePool{}), mock.Anything)
+}
+
+func TestProvisionNodes_IncreasesReplicas(t *testing.T) {
+	mockClient := test.NewClient()
+	mockNodeClassReady(mockClient, "image-family-ubuntu")
+	mockEmptyNodeList(mockClient)
+
+	// NodePool exists with replicas=1, target=3, no BYO → desired=3 > current=1, should update.
+	existingNP := &karpenterv1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "default-ws1"},
+		Spec:       karpenterv1.NodePoolSpec{Replicas: lo.ToPtr(int64(1))},
+	}
+	mockClient.CreateOrUpdateObjectInMap(existingNP)
+	mockClient.On("Get", mock.IsType(context.Background()), mock.MatchedBy(func(key client.ObjectKey) bool {
+		return key.Name == "default-ws1"
+	}), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(nil)
+	mockClient.On("Update", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(nil)
+
+	p := NewKarpenterProvisioner(mockClient, testConfig)
+	ws := newTestWorkspace("default", "ws1", "Standard_NC24ads_A100_v4", 3, nil, nil)
+
+	err := p.ProvisionNodes(context.Background(), ws)
+	assert.NoError(t, err)
+
+	for _, call := range mockClient.Calls {
+		if call.Method == "Update" {
+			if np, ok := call.Arguments[1].(*karpenterv1.NodePool); ok {
+				assert.Equal(t, int64(3), *np.Spec.Replicas)
+			}
+		}
+	}
+}
+
+func TestProvisionNodes_NoUpdateWhenReplicasUnchanged(t *testing.T) {
+	mockClient := test.NewClient()
+	mockNodeClassReady(mockClient, "image-family-ubuntu")
+	mockEmptyNodeList(mockClient)
+
+	// NodePool exists with replicas=2, target=2, no BYO → desired=2, no update needed.
+	existingNP := &karpenterv1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "default-ws1"},
+		Spec:       karpenterv1.NodePoolSpec{Replicas: lo.ToPtr(int64(2))},
+	}
+	mockClient.CreateOrUpdateObjectInMap(existingNP)
+	mockClient.On("Get", mock.IsType(context.Background()), mock.MatchedBy(func(key client.ObjectKey) bool {
+		return key.Name == "default-ws1"
+	}), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(nil)
+
+	p := NewKarpenterProvisioner(mockClient, testConfig)
+	ws := newTestWorkspace("default", "ws1", "Standard_NC24ads_A100_v4", 2, nil, nil)
+
+	err := p.ProvisionNodes(context.Background(), ws)
+	assert.NoError(t, err)
+	mockClient.AssertNotCalled(t, "Update", mock.Anything, mock.Anything, mock.Anything)
 }
 
 func TestProvisionNodes_AlreadyExists(t *testing.T) {
 	mockClient := test.NewClient()
 	mockNodeClassReady(mockClient, "image-family-ubuntu")
+	mockEmptyNodeList(mockClient)
+	mockNodePoolNotFound(mockClient, "default-ws1")
 	alreadyExistsErr := apierrors.NewAlreadyExists(schema.GroupResource{Group: "karpenter.sh", Resource: "nodepools"}, "default-ws1")
 	mockClient.On("Create", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(alreadyExistsErr)
 
@@ -116,6 +336,8 @@ func TestProvisionNodes_AlreadyExists(t *testing.T) {
 func TestProvisionNodes_CreateError(t *testing.T) {
 	mockClient := test.NewClient()
 	mockNodeClassReady(mockClient, "image-family-ubuntu")
+	mockEmptyNodeList(mockClient)
+	mockNodePoolNotFound(mockClient, "default-ws1")
 	mockClient.On("Create", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(errors.New("API server down"))
 
 	p := NewKarpenterProvisioner(mockClient, testConfig)
@@ -129,6 +351,8 @@ func TestProvisionNodes_CreateError(t *testing.T) {
 func TestProvisionNodes_UsesDefaultNodeClassName(t *testing.T) {
 	mockClient := test.NewClient()
 	mockNodeClassReady(mockClient, "image-family-ubuntu")
+	mockEmptyNodeList(mockClient)
+	mockNodePoolNotFound(mockClient, "default-ws1")
 	mockClient.On("Create", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(nil)
 
 	p := NewKarpenterProvisioner(mockClient, testConfig)
@@ -137,22 +361,20 @@ func TestProvisionNodes_UsesDefaultNodeClassName(t *testing.T) {
 	err := p.ProvisionNodes(context.Background(), ws)
 	assert.NoError(t, err)
 
-	found := false
 	for _, call := range mockClient.Calls {
 		if call.Method == "Create" {
-			createdNP, ok := call.Arguments[1].(*karpenterv1.NodePool)
-			if ok {
+			if createdNP, ok := call.Arguments[1].(*karpenterv1.NodePool); ok {
 				assert.Equal(t, "image-family-ubuntu", createdNP.Spec.Template.Spec.NodeClassRef.Name)
-				found = true
 			}
 		}
 	}
-	assert.True(t, found, "expected Create to be called with a NodePool")
 }
 
 func TestProvisionNodes_UsesAnnotationNodeClassName(t *testing.T) {
 	mockClient := test.NewClient()
 	mockNodeClassReady(mockClient, "image-family-azure-linux")
+	mockEmptyNodeList(mockClient)
+	mockNodePoolNotFound(mockClient, "default-ws1")
 	mockClient.On("Create", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(nil)
 
 	p := NewKarpenterProvisioner(mockClient, testConfig)
@@ -165,8 +387,7 @@ func TestProvisionNodes_UsesAnnotationNodeClassName(t *testing.T) {
 
 	for _, call := range mockClient.Calls {
 		if call.Method == "Create" {
-			createdNP, ok := call.Arguments[1].(*karpenterv1.NodePool)
-			if ok {
+			if createdNP, ok := call.Arguments[1].(*karpenterv1.NodePool); ok {
 				assert.Equal(t, "image-family-azure-linux", createdNP.Spec.Template.Spec.NodeClassRef.Name)
 			}
 		}
@@ -362,26 +583,18 @@ func TestDisableDriftRemediation_NodePoolNotFound(t *testing.T) {
 
 // --- EnsureNodesReady tests ---
 
-func TestEnsureNodesReady_AllReady(t *testing.T) {
+func TestEnsureNodesReady_AllReady_BYOOnly(t *testing.T) {
 	mockClient := test.NewClient()
 
-	nc := &karpenterv1.NodeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "nc-1",
-			Labels: map[string]string{
-				karpenterv1.NodePoolLabelKey: "default-ws1",
-			},
-		},
-		Status: karpenterv1.NodeClaimStatus{
-			Conditions: []status.Condition{
-				{Type: "Ready", Status: metav1.ConditionTrue},
-			},
-		},
-	}
-	nodeClaimList := &karpenterv1.NodeClaimList{}
-	relevantMap := mockClient.CreateMapWithType(nodeClaimList)
-	relevantMap[client.ObjectKeyFromObject(nc)] = nc
+	// 1 ready BYO node with correct instance type.
+	nodeList := &corev1.NodeList{}
+	nodeMap := mockClient.CreateMapWithType(nodeList)
+	nodeMap[client.ObjectKeyFromObject(makeReadyNode("byo-1", "Standard_NC24ads_A100_v4", nil))] =
+		makeReadyNode("byo-1", "Standard_NC24ads_A100_v4", nil)
+	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&corev1.NodeList{}), mock.Anything).Return(nil)
 
+	// No karpenter NodeClaims.
+	mockClient.CreateMapWithType(&karpenterv1.NodeClaimList{})
 	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodeClaimList{}), mock.Anything).Return(nil)
 
 	p := NewKarpenterProvisioner(mockClient, testConfig)
@@ -393,42 +606,52 @@ func TestEnsureNodesReady_AllReady(t *testing.T) {
 	assert.False(t, needRequeue)
 }
 
-func TestEnsureNodesReady_SomeNotReady(t *testing.T) {
+func TestEnsureNodesReady_MixedBYOAndKarpenter(t *testing.T) {
 	mockClient := test.NewClient()
 
+	// 1 BYO + 1 karpenter node, target=2.
+	nodeList := &corev1.NodeList{}
+	nodeMap := mockClient.CreateMapWithType(nodeList)
+	byoNode := makeReadyNode("byo-1", "Standard_NC24ads_A100_v4", nil)
+	karpNode := makeReadyNode("karp-1", "Standard_NC24ads_A100_v4", map[string]string{
+		consts.KarpenterWorkspaceNameKey: "ws1",
+	})
+	nodeMap[client.ObjectKeyFromObject(byoNode)] = byoNode
+	nodeMap[client.ObjectKeyFromObject(karpNode)] = karpNode
+	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&corev1.NodeList{}), mock.Anything).Return(nil)
+
+	// 1 karpenter NodeClaim ready.
 	nc := &karpenterv1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "nc-1",
-			Labels: map[string]string{
-				karpenterv1.NodePoolLabelKey: "default-ws1",
-			},
+			Name:   "nc-1",
+			Labels: map[string]string{karpenterv1.NodePoolLabelKey: "default-ws1"},
 		},
 		Status: karpenterv1.NodeClaimStatus{
-			Conditions: []status.Condition{
-				{Type: "Ready", Status: metav1.ConditionFalse},
-			},
+			Conditions: []status.Condition{{Type: "Ready", Status: metav1.ConditionTrue}},
 		},
 	}
-	nodeClaimList := &karpenterv1.NodeClaimList{}
-	relevantMap := mockClient.CreateMapWithType(nodeClaimList)
-	relevantMap[client.ObjectKeyFromObject(nc)] = nc
-
+	ncList := &karpenterv1.NodeClaimList{}
+	ncMap := mockClient.CreateMapWithType(ncList)
+	ncMap[client.ObjectKeyFromObject(nc)] = nc
 	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodeClaimList{}), mock.Anything).Return(nil)
 
 	p := NewKarpenterProvisioner(mockClient, testConfig)
-	ws := newTestWorkspace("default", "ws1", "Standard_NC24ads_A100_v4", 1, nil, nil)
+	ws := newTestWorkspace("default", "ws1", "Standard_NC24ads_A100_v4", 2, nil, nil)
 
 	ready, needRequeue, err := p.EnsureNodesReady(context.Background(), ws)
 	assert.NoError(t, err)
-	assert.False(t, ready)
+	assert.True(t, ready)
 	assert.False(t, needRequeue)
 }
 
 func TestEnsureNodesReady_CountBelowTarget(t *testing.T) {
 	mockClient := test.NewClient()
 
+	// No karpenter NodeClaims.
 	mockClient.CreateMapWithType(&karpenterv1.NodeClaimList{})
 	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodeClaimList{}), mock.Anything).Return(nil)
+
+	mockEmptyNodeList(mockClient)
 
 	p := NewKarpenterProvisioner(mockClient, testConfig)
 	ws := newTestWorkspace("default", "ws1", "Standard_NC24ads_A100_v4", 2, nil, nil)
@@ -451,30 +674,22 @@ func TestEnsureNodesReady_ListError(t *testing.T) {
 	assert.Contains(t, err.Error(), "API error")
 }
 
-func TestEnsureNodesReady_NodeClaimBeingDeleted(t *testing.T) {
+func TestEnsureNodesReady_DeletingNodeNotCounted(t *testing.T) {
 	mockClient := test.NewClient()
 
-	now := metav1.Now()
-	nc := &karpenterv1.NodeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "nc-1",
-			DeletionTimestamp: &now,
-			Finalizers:        []string{"karpenter.sh/termination"},
-			Labels: map[string]string{
-				karpenterv1.NodePoolLabelKey: "default-ws1",
-			},
-		},
-		Status: karpenterv1.NodeClaimStatus{
-			Conditions: []status.Condition{
-				{Type: "Ready", Status: metav1.ConditionTrue},
-			},
-		},
-	}
-	nodeClaimList := &karpenterv1.NodeClaimList{}
-	relevantMap := mockClient.CreateMapWithType(nodeClaimList)
-	relevantMap[client.ObjectKeyFromObject(nc)] = nc
-
+	// No karpenter NodeClaims.
+	mockClient.CreateMapWithType(&karpenterv1.NodeClaimList{})
 	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodeClaimList{}), mock.Anything).Return(nil)
+
+	// 1 node being deleted — should not count.
+	now := metav1.Now()
+	deletingNode := makeReadyNode("deleting-1", "Standard_NC24ads_A100_v4", nil)
+	deletingNode.DeletionTimestamp = &now
+	deletingNode.Finalizers = []string{"test/finalizer"}
+	nodeList := &corev1.NodeList{}
+	nodeMap := mockClient.CreateMapWithType(nodeList)
+	nodeMap[client.ObjectKeyFromObject(deletingNode)] = deletingNode
+	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&corev1.NodeList{}), mock.Anything).Return(nil)
 
 	p := NewKarpenterProvisioner(mockClient, testConfig)
 	ws := newTestWorkspace("default", "ws1", "Standard_NC24ads_A100_v4", 1, nil, nil)
@@ -487,26 +702,18 @@ func TestEnsureNodesReady_NodeClaimBeingDeleted(t *testing.T) {
 
 // --- CollectNodeStatusInfo tests ---
 
-func TestCollectNodeStatusInfo_AllReady(t *testing.T) {
+func TestCollectNodeStatusInfo_AllReady_BYOOnly(t *testing.T) {
 	mockClient := test.NewClient()
 
-	nc := &karpenterv1.NodeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "nc-1",
-			Labels: map[string]string{
-				karpenterv1.NodePoolLabelKey: "default-ws1",
-			},
-		},
-		Status: karpenterv1.NodeClaimStatus{
-			Conditions: []status.Condition{
-				{Type: "Ready", Status: metav1.ConditionTrue},
-			},
-		},
-	}
-	nodeClaimList := &karpenterv1.NodeClaimList{}
-	relevantMap := mockClient.CreateMapWithType(nodeClaimList)
-	relevantMap[client.ObjectKeyFromObject(nc)] = nc
+	// 1 ready BYO node.
+	nodeList := &corev1.NodeList{}
+	nodeMap := mockClient.CreateMapWithType(nodeList)
+	nodeMap[client.ObjectKeyFromObject(makeReadyNode("byo-1", "Standard_NC24ads_A100_v4", nil))] =
+		makeReadyNode("byo-1", "Standard_NC24ads_A100_v4", nil)
+	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&corev1.NodeList{}), mock.Anything).Return(nil)
 
+	// No karpenter NodeClaims.
+	mockClient.CreateMapWithType(&karpenterv1.NodeClaimList{})
 	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodeClaimList{}), mock.Anything).Return(nil)
 
 	p := NewKarpenterProvisioner(mockClient, testConfig)
@@ -521,8 +728,9 @@ func TestCollectNodeStatusInfo_AllReady(t *testing.T) {
 	}
 }
 
-func TestCollectNodeStatusInfo_NotEnoughNodeClaims(t *testing.T) {
+func TestCollectNodeStatusInfo_NotEnoughNodes(t *testing.T) {
 	mockClient := test.NewClient()
+	mockEmptyNodeList(mockClient)
 
 	mockClient.CreateMapWithType(&karpenterv1.NodeClaimList{})
 	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodeClaimList{}), mock.Anything).Return(nil)
@@ -554,23 +762,13 @@ func TestCollectNodeStatusInfo_ListError(t *testing.T) {
 func TestCollectNodeStatusInfo_ConditionTypes(t *testing.T) {
 	mockClient := test.NewClient()
 
-	nc := &karpenterv1.NodeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "nc-1",
-			Labels: map[string]string{
-				karpenterv1.NodePoolLabelKey: "default-ws1",
-			},
-		},
-		Status: karpenterv1.NodeClaimStatus{
-			Conditions: []status.Condition{
-				{Type: "Ready", Status: metav1.ConditionTrue},
-			},
-		},
-	}
-	nodeClaimList := &karpenterv1.NodeClaimList{}
-	relevantMap := mockClient.CreateMapWithType(nodeClaimList)
-	relevantMap[client.ObjectKeyFromObject(nc)] = nc
+	nodeList := &corev1.NodeList{}
+	nodeMap := mockClient.CreateMapWithType(nodeList)
+	nodeMap[client.ObjectKeyFromObject(makeReadyNode("node-1", "Standard_NC24ads_A100_v4", nil))] =
+		makeReadyNode("node-1", "Standard_NC24ads_A100_v4", nil)
+	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&corev1.NodeList{}), mock.Anything).Return(nil)
 
+	mockClient.CreateMapWithType(&karpenterv1.NodeClaimList{})
 	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodeClaimList{}), mock.Anything).Return(nil)
 
 	p := NewKarpenterProvisioner(mockClient, testConfig)
