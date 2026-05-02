@@ -113,6 +113,18 @@ func IsRunBenchmarkEnabled(ws *Workspace) bool {
 	return ws.Annotations[AnnotationDisableBenchmark] != "true"
 }
 
+// ShouldRunBenchmark reports whether the workspace should run the post-load
+// benchmark. The benchmark requires all of the following:
+//  1. The benchmark is not disabled via annotation.
+//  2. The workspace uses the vLLM runtime (benchmark_entrypoint.py is vLLM-only).
+//  3. The workspace uses a preset inference config (template workspaces use
+//     custom containers that do not include the benchmark entrypoint).
+func ShouldRunBenchmark(ws *Workspace) bool {
+	return IsRunBenchmarkEnabled(ws) &&
+		GetWorkspaceRuntimeName(ws) == model.RuntimeNameVLLM &&
+		ws.Inference != nil && ws.Inference.Preset != nil
+}
+
 // GetPerformanceMode returns the performance mode annotation value, defaulting to
 // PerformanceModeBalanced when the annotation is absent or empty.
 func GetPerformanceMode(ws *Workspace) string {

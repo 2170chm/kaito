@@ -193,7 +193,7 @@ func GeneratePresetInference(ctx context.Context, workspaceObj *v1beta1.Workspac
 	if distributed {
 		podOpts = append(podOpts, SetDistributedInferenceProbe)
 	}
-	if v1beta1.IsRunBenchmarkEnabled(workspaceObj) && v1beta1.GetWorkspaceRuntimeName(workspaceObj) == pkgmodel.RuntimeNameVLLM {
+	if v1beta1.ShouldRunBenchmark(workspaceObj) {
 		podOpts = append(podOpts, SetBenchmarkConfig(distributed))
 	}
 

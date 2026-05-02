@@ -114,3 +114,13 @@ func GetInferenceSetRuntimeName(iObj *InferenceSet) model.RuntimeName {
 func IsRunBenchmarkEnabled(iObj *InferenceSet) bool {
 	return iObj.Annotations[AnnotationDisableBenchmark] != "true"
 }
+
+// ShouldRunBenchmark reports whether the InferenceSet's child workspaces should
+// run the post-load benchmark. Same criteria as the Workspace-level check:
+// benchmark must be enabled, runtime must be vLLM, and the template must use a
+// preset (not a custom container template).
+func ShouldRunBenchmark(iObj *InferenceSet) bool {
+	return IsRunBenchmarkEnabled(iObj) &&
+		GetInferenceSetRuntimeName(iObj) == model.RuntimeNameVLLM &&
+		iObj.Spec.Template.Inference.Preset != nil
+}

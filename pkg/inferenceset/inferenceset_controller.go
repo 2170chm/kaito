@@ -319,7 +319,7 @@ func (c *InferenceSetReconciler) addOrUpdateInferenceSet(ctx context.Context, iO
 		status.ReadyReplicas = readyReplicas
 		// set selector for HPA/VPA
 		status.Selector = fmt.Sprintf("%s=%s", consts.WorkspaceCreatedByInferenceSetLabel, iObj.Name)
-		if kaitov1alpha1.IsRunBenchmarkEnabled(iObj) {
+		if kaitov1alpha1.ShouldRunBenchmark(iObj) {
 			if hasBenchmarkTPMResult {
 				if status.Performance == nil {
 					status.Performance = &kaitov1alpha1.Performance{}
@@ -374,7 +374,7 @@ func (c *InferenceSetReconciler) addOrUpdateInferenceSet(ctx context.Context, iO
 	}
 
 	// Surface benchmark progress when the annotation is set.
-	if kaitov1alpha1.IsRunBenchmarkEnabled(iObj) {
+	if kaitov1alpha1.ShouldRunBenchmark(iObj) {
 		if benchmarkedReplicas == iObj.Spec.Replicas && iObj.Spec.Replicas > 0 {
 			if err = inferenceset.UpdateStatusConditionIfNotMatch(ctx, c.Client, iObj, kaitov1alpha1.InferenceSetConditionTypeBenchmarkCompleted, metav1.ConditionTrue,
 				"BenchmarkCompleted", fmt.Sprintf("%d/%d replicas benchmarked", benchmarkedReplicas, iObj.Spec.Replicas)); err != nil {
