@@ -375,8 +375,7 @@ func (p *KarpenterProvisioner) DeleteNodes(ctx context.Context, ws *kaitov1beta1
 }
 
 // nodeReadinessSnapshot holds pre-computed data about node and NodeClaim readiness
-// for a workspace. Used by EnsureNodesReady and CollectNodeStatusInfo to avoid
-// duplicating the same list+count logic.
+// for a workspace.
 type nodeReadinessSnapshot struct {
 	// readyWithInstanceTypeCount is the total number of ready nodes (BYO + legacy + karpenter)
 	// that have the correct instance type for the workspace. Used to determine overall node readiness.
