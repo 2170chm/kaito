@@ -378,10 +378,18 @@ func (p *KarpenterProvisioner) DeleteNodes(ctx context.Context, ws *kaitov1beta1
 // for a workspace. Used by EnsureNodesReady and CollectNodeStatusInfo to avoid
 // duplicating the same list+count logic.
 type nodeReadinessSnapshot struct {
+	// readyWithInstanceTypeCount is the total number of ready nodes (BYO + legacy + karpenter)
+	// that have the correct instance type for the workspace. Used to determine overall node readiness.
 	readyWithInstanceTypeCount int
+	// coveredByNonKarpenterCount is the number of nodes already handled outside karpenter:
+	// ready BYO nodes + non-deleting legacy gpu-provisioner NodeClaims (regardless of node readiness).
 	coveredByNonKarpenterCount int
-	targetNodeClaimCount       int
-	readyNodeClaims            []*karpenterv1.NodeClaim
+	// targetNodeClaimCount is the number of karpenter NodeClaims needed:
+	// max(0, ws.Status.TargetNodeCount - coveredByNonKarpenterCount).
+	targetNodeClaimCount int
+	// readyNodeClaims is the subset of karpenter-managed NodeClaims that are Ready and not deleting.
+	// Used for GPU plugin readiness checks.
+	readyNodeClaims []*karpenterv1.NodeClaim
 }
 
 // buildNodeReadinessSnapshot lists karpenter NodeClaims and all workspace nodes,
