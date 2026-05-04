@@ -73,6 +73,12 @@ func mockEmptyNodeList(mockClient *test.MockClient) {
 	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&corev1.NodeList{}), mock.Anything).Return(nil)
 }
 
+// mockEmptyLegacyNodeClaims sets up an empty NodeClaimList for legacy NodeClaim List calls.
+func mockEmptyLegacyNodeClaims(mockClient *test.MockClient) {
+	mockClient.CreateMapWithType(&karpenterv1.NodeClaimList{})
+	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodeClaimList{}), mock.Anything).Return(nil)
+}
+
 // mockNodePoolNotFound sets up a Get call for NodePool that returns NotFound.
 func mockNodePoolNotFound(mockClient *test.MockClient, name string) {
 	notFoundErr := apierrors.NewNotFound(schema.GroupResource{Group: "karpenter.sh", Resource: "nodepools"}, name)
@@ -130,6 +136,7 @@ func TestProvisionNodes_NoBYONodes_CreatesWithFullReplicas(t *testing.T) {
 	mockClient := test.NewClient()
 	mockNodeClassReady(mockClient, "image-family-ubuntu")
 	mockEmptyNodeList(mockClient)
+	mockEmptyLegacyNodeClaims(mockClient)
 	mockNodePoolNotFound(mockClient, "default-ws1")
 	mockClient.On("Create", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(nil)
 
@@ -159,6 +166,7 @@ func TestProvisionNodes_DeltaWithBYONodes(t *testing.T) {
 	nodeMap[client.ObjectKeyFromObject(makeReadyNode("byo-1", "Standard_NC24ads_A100_v4", nil))] =
 		makeReadyNode("byo-1", "Standard_NC24ads_A100_v4", nil)
 	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&corev1.NodeList{}), mock.Anything).Return(nil)
+	mockEmptyLegacyNodeClaims(mockClient)
 
 	mockNodePoolNotFound(mockClient, "default-ws1")
 	mockClient.On("Create", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(nil)
@@ -191,6 +199,7 @@ func TestProvisionNodes_KarpenterNodesExcludedFromDelta(t *testing.T) {
 	})
 	nodeMap[client.ObjectKeyFromObject(karpenterNode)] = karpenterNode
 	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&corev1.NodeList{}), mock.Anything).Return(nil)
+	mockEmptyLegacyNodeClaims(mockClient)
 
 	mockNodePoolNotFound(mockClient, "default-ws1")
 	mockClient.On("Create", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(nil)
@@ -223,6 +232,7 @@ func TestProvisionNodes_ZeroReplicasWhenBYOSufficient_NoCreateCalled(t *testing.
 		nodeMap[client.ObjectKeyFromObject(node)] = node
 	}
 	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&corev1.NodeList{}), mock.Anything).Return(nil)
+	mockEmptyLegacyNodeClaims(mockClient)
 
 	mockNodePoolNotFound(mockClient, "default-ws1")
 
@@ -244,6 +254,7 @@ func TestProvisionNodes_DoesNotDecreaseReplicas(t *testing.T) {
 	nodeMap[client.ObjectKeyFromObject(makeReadyNode("byo-1", "Standard_NC24ads_A100_v4", nil))] =
 		makeReadyNode("byo-1", "Standard_NC24ads_A100_v4", nil)
 	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&corev1.NodeList{}), mock.Anything).Return(nil)
+	mockEmptyLegacyNodeClaims(mockClient)
 
 	// NodePool exists with replicas=2.
 	existingNP := &karpenterv1.NodePool{
@@ -268,6 +279,7 @@ func TestProvisionNodes_IncreasesReplicas(t *testing.T) {
 	mockClient := test.NewClient()
 	mockNodeClassReady(mockClient, "image-family-ubuntu")
 	mockEmptyNodeList(mockClient)
+	mockEmptyLegacyNodeClaims(mockClient)
 
 	// NodePool exists with replicas=1, target=3, no BYO → desired=3 > current=1, should update.
 	existingNP := &karpenterv1.NodePool{
@@ -299,6 +311,7 @@ func TestProvisionNodes_NoUpdateWhenReplicasUnchanged(t *testing.T) {
 	mockClient := test.NewClient()
 	mockNodeClassReady(mockClient, "image-family-ubuntu")
 	mockEmptyNodeList(mockClient)
+	mockEmptyLegacyNodeClaims(mockClient)
 
 	// NodePool exists with replicas=2, target=2, no BYO → desired=2, no update needed.
 	existingNP := &karpenterv1.NodePool{
@@ -322,6 +335,7 @@ func TestProvisionNodes_AlreadyExists(t *testing.T) {
 	mockClient := test.NewClient()
 	mockNodeClassReady(mockClient, "image-family-ubuntu")
 	mockEmptyNodeList(mockClient)
+	mockEmptyLegacyNodeClaims(mockClient)
 	mockNodePoolNotFound(mockClient, "default-ws1")
 	alreadyExistsErr := apierrors.NewAlreadyExists(schema.GroupResource{Group: "karpenter.sh", Resource: "nodepools"}, "default-ws1")
 	mockClient.On("Create", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(alreadyExistsErr)
@@ -337,6 +351,7 @@ func TestProvisionNodes_CreateError(t *testing.T) {
 	mockClient := test.NewClient()
 	mockNodeClassReady(mockClient, "image-family-ubuntu")
 	mockEmptyNodeList(mockClient)
+	mockEmptyLegacyNodeClaims(mockClient)
 	mockNodePoolNotFound(mockClient, "default-ws1")
 	mockClient.On("Create", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(errors.New("API server down"))
 
@@ -352,6 +367,7 @@ func TestProvisionNodes_UsesDefaultNodeClassName(t *testing.T) {
 	mockClient := test.NewClient()
 	mockNodeClassReady(mockClient, "image-family-ubuntu")
 	mockEmptyNodeList(mockClient)
+	mockEmptyLegacyNodeClaims(mockClient)
 	mockNodePoolNotFound(mockClient, "default-ws1")
 	mockClient.On("Create", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(nil)
 
@@ -374,6 +390,7 @@ func TestProvisionNodes_UsesAnnotationNodeClassName(t *testing.T) {
 	mockClient := test.NewClient()
 	mockNodeClassReady(mockClient, "image-family-azure-linux")
 	mockEmptyNodeList(mockClient)
+	mockEmptyLegacyNodeClaims(mockClient)
 	mockNodePoolNotFound(mockClient, "default-ws1")
 	mockClient.On("Create", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodePool{}), mock.Anything).Return(nil)
 
@@ -652,6 +669,7 @@ func TestEnsureNodesReady_CountBelowTarget(t *testing.T) {
 	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodeClaimList{}), mock.Anything).Return(nil)
 
 	mockEmptyNodeList(mockClient)
+	mockEmptyLegacyNodeClaims(mockClient)
 
 	p := NewKarpenterProvisioner(mockClient, testConfig)
 	ws := newTestWorkspace("default", "ws1", "Standard_NC24ads_A100_v4", 2, nil, nil)
@@ -731,6 +749,7 @@ func TestCollectNodeStatusInfo_AllReady_BYOOnly(t *testing.T) {
 func TestCollectNodeStatusInfo_NotEnoughNodes(t *testing.T) {
 	mockClient := test.NewClient()
 	mockEmptyNodeList(mockClient)
+	mockEmptyLegacyNodeClaims(mockClient)
 
 	mockClient.CreateMapWithType(&karpenterv1.NodeClaimList{})
 	mockClient.On("List", mock.IsType(context.Background()), mock.IsType(&karpenterv1.NodeClaimList{}), mock.Anything).Return(nil)
