@@ -61,10 +61,10 @@ const (
 	// as the NodeClassRef name instead of the configured default.
 	AnnotationNodeClassName = KAITOPrefix + "node-class-name"
 
-	// AnnotationRunBenchmark enables the post-load throughput benchmark stage.
-	// When set to "true" on a Workspace, the inference container runs a guidellm
-	// benchmark after the model loads before marking the container as ready.
-	AnnotationRunBenchmark = KAITOPrefix + "run-benchmark"
+	// AnnotationDisableBenchmark disables the post-load throughput benchmark stage.
+	// The benchmark is enabled by default. Set to "true" on a Workspace to
+	// disable it; when absent or any other value, the benchmark runs.
+	AnnotationDisableBenchmark = KAITOPrefix + "disable-benchmark"
 
 	// AnnotationPerformanceMode selects the vLLM performance preset.
 	// Valid values are "balanced" (default), "interactivity", and "throughput".
@@ -106,10 +106,23 @@ func GetWorkspaceRuntimeName(ws *Workspace) model.RuntimeName {
 	return runtime
 }
 
-// IsRunBenchmarkEnabled reports whether the workspace has the benchmark
-// annotation set to "true".
+// IsRunBenchmarkEnabled reports whether the workspace benchmark is enabled.
+// The benchmark is on by default; it is only disabled when the annotation
+// kaito.sh/disable-benchmark is explicitly set to "true".
 func IsRunBenchmarkEnabled(ws *Workspace) bool {
-	return ws.Annotations[AnnotationRunBenchmark] == "true"
+	return ws.Annotations[AnnotationDisableBenchmark] != "true"
+}
+
+// ShouldRunBenchmark reports whether the workspace should run the post-load
+// benchmark. The benchmark requires all of the following:
+//  1. The benchmark is not disabled via annotation.
+//  2. The workspace uses the vLLM runtime (benchmark_entrypoint.py is vLLM-only).
+//  3. The workspace uses a preset inference config (template workspaces use
+//     custom containers that do not include the benchmark entrypoint).
+func ShouldRunBenchmark(ws *Workspace) bool {
+	return IsRunBenchmarkEnabled(ws) &&
+		GetWorkspaceRuntimeName(ws) == model.RuntimeNameVLLM &&
+		ws.Inference != nil && ws.Inference.Preset != nil
 }
 
 // GetPerformanceMode returns the performance mode annotation value, defaulting to
