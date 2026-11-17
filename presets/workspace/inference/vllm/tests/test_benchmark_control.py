@@ -103,7 +103,7 @@ def test_abort_requests_pauses_with_abort_then_resumes():
     response = _run(middleware.dispatch(request, AsyncMock()))
 
     assert response.status_code == 200
-    engine.pause_generation.assert_awaited_once_with(mode="abort", clear_cache=True)
+    engine.pause_generation.assert_awaited_once_with(mode="abort", clear_cache=False)
     engine.resume_generation.assert_awaited_once_with()
 
 
